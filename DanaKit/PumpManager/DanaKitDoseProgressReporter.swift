@@ -3,8 +3,12 @@ import LoopKit
 
 class DanaKitDoseProgressReporter: DoseProgressReporter {
     var progress: DoseProgress {
-        DoseProgress(deliveredUnits: deliveredUnits, percentComplete: deliveredUnits / total)
+        lock.withLock {
+            DoseProgress(deliveredUnits: deliveredUnits, percentComplete: deliveredUnits / total)
+        }
     }
+
+    @Locked var reportingQueue: DispatchQueue = .main
 
     private let lock = UnfairLock()
     private var observers = WeakSet<DoseProgressObserver>()
@@ -17,19 +21,23 @@ class DanaKitDoseProgressReporter: DoseProgressReporter {
     }
 
     public func addObserver(_ observer: DoseProgressObserver) {
-        observers.insert(observer)
+        lock.withLock { observers.insert(observer) }
     }
 
     public func removeObserver(_ observer: DoseProgressObserver) {
-        observers.remove(observer)
+        lock.withLock { observers.remove(observer) }
     }
 
     public func notify(deliveredUnits: Double) {
-        self.deliveredUnits = deliveredUnits
-        let observersCopy = lock.withLock { observers }
+        let observersCopy = lock.withLock {
+            self.deliveredUnits = deliveredUnits
+            return observers
+        }
 
-        for observer in observersCopy {
-            observer.doseProgressReporterDidUpdate(self)
+        reportingQueue.async {
+            for observer in observersCopy {
+                observer.doseProgressReporterDidUpdate(self)
+            }
         }
     }
 }
