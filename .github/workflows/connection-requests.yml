@@ -1,0 +1,76 @@
+name: Connection request regression tests
+on:
+  push:
+    branches: ["fix/interactive-connection-requests"]
+  pull_request:
+    paths:
+      - "DanaKit/PumpManager/InteractiveBluetoothManager.swift"
+      - "Common/Locked.swift"
+      - "Scripts/connection-test-support/**"
+      - "Scripts/test-connection-requests.sh"
+      - ".github/workflows/connection-requests.yml"
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  connection-requests:
+    runs-on: macos-15
+    timeout-minutes: 10
+    steps:
+      - name: Select Xcode 26.3
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - name: Confirm the regression fails on the original implementation
+        run: |
+          if DANA_SOURCE_REF=eadb9fefc0e48df6639e1a9de5147ecf6a110caf bash Scripts/test-connection-requests.sh > baseline.log 2>&1; then
+            cat baseline.log
+            echo "Expected the original implementation to fail the regression tests"
+            exit 1
+          fi
+          cat baseline.log
+          grep -q "Test run with .* failed" baseline.log
+      - name: Run isolated connection ownership tests
+        run: bash Scripts/test-connection-requests.sh
+      - name: Run connection ownership tests with Thread Sanitizer
+        run: bash Scripts/test-connection-requests.sh --sanitize=thread
+  ios-build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Select Xcode 26.3
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+      - uses: actions/checkout@v4
+      - name: Checkout the LoopKit version used by LoopWorkspace feat/all-managers
+        uses: actions/checkout@v4
+        with:
+          repository: LoopKit/LoopKit
+          ref: d9f1437353482690426bd981536f58c1e95ff535
+          path: LoopKit
+      - name: Create a test workspace
+        run: |
+          mkdir DanaKitTests.xcworkspace
+          cat > DanaKitTests.xcworkspace/contents.xcworkspacedata <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Workspace version="1.0">
+            <FileRef location="group:DanaKit.xcodeproj"/>
+            <FileRef location="group:LoopKit/LoopKit.xcodeproj"/>
+          </Workspace>
+          XML
+      - name: Build DanaKit for the iOS Simulator
+        run: |
+          set -o pipefail
+          xcodebuild -version
+          xcodebuild build -workspace DanaKitTests.xcworkspace -scheme DanaKit \
+            -destination 'generic/platform=iOS Simulator' \
+            -resultBundlePath TestResults.xcresult CODE_SIGNING_ALLOWED=NO \
+            | tee xcodebuild.log
+      - name: Upload test diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dana-ios-test-results
+          path: |
+            TestResults.xcresult
+            xcodebuild.log
