@@ -1,0 +1,143 @@
+name: Validate DanaKit fixes with Trio
+on:
+  push:
+    branches: ["validation/trio-compatibility"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  trio:
+    name: Trio ${{ matrix.trio }} - ${{ matrix.fix }}
+    runs-on: macos-26
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        include:
+          - trio: main
+            trio_sha: 0b29cd53415e7f0e668677749cad8daf81c68c2f
+            baseline: e157a861c691f44c84df6071233edb935c06e7dc
+            fix: connection
+            dana_sha: 06151aebf0956f74f6ea6ce41637d5a8e5c36cd2
+          - trio: main
+            trio_sha: 0b29cd53415e7f0e668677749cad8daf81c68c2f
+            baseline: e157a861c691f44c84df6071233edb935c06e7dc
+            fix: progress
+            dana_sha: 51c12f0cb27f18f0bb047c44daeb19bc28ecce0e
+          - trio: dev
+            trio_sha: c6b47419ea80d9c980779aea5cf4961504739024
+            baseline: eadb9fefc0e48df6639e1a9de5147ecf6a110caf
+            fix: connection
+            dana_sha: 06151aebf0956f74f6ea6ce41637d5a8e5c36cd2
+          - trio: dev
+            trio_sha: c6b47419ea80d9c980779aea5cf4961504739024
+            baseline: eadb9fefc0e48df6639e1a9de5147ecf6a110caf
+            fix: progress
+            dana_sha: 51c12f0cb27f18f0bb047c44daeb19bc28ecce0e
+    defaults:
+      run:
+        working-directory: Trio
+        shell: bash
+    steps:
+      - name: Checkout pinned Trio and its dependencies
+        uses: actions/checkout@v5
+        with:
+          repository: nightscout/Trio
+          ref: ${{ matrix.trio_sha }}
+          path: Trio
+          submodules: recursive
+          persist-credentials: false
+      - name: Select Trio CI toolchain
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_26.2.app/Contents/Developer
+          xcodebuild -version
+      - name: Install the exact DanaKit fix
+        env:
+          DANA_SHA: ${{ matrix.dana_sha }}
+          BASELINE: ${{ matrix.baseline }}
+        run: |
+          set -euo pipefail
+          test "$(git -C DanaKit rev-parse HEAD)" = "$BASELINE"
+          git -C DanaKit fetch --no-tags https://github.com/jbayart/DanaKit.git "$DANA_SHA"
+          git -C DanaKit checkout --detach FETCH_HEAD
+          test "$(git -C DanaKit rev-parse HEAD)" = "$DANA_SHA"
+          git submodule status --recursive | tee source-revisions.txt
+          echo "Trio ${{ matrix.trio_sha }} / DanaKit $DANA_SHA" >> "$GITHUB_STEP_SUMMARY"
+      - name: Scan external usage of changed APIs
+        run: |
+          git grep -n -E 'alreadyConnectedAndBusy|ConnectionResult|createBolusProgressReporter|doseProgressReporterDidUpdate|ensureConnected' -- '*.swift' > compatibility-api-usage.txt || test "$?" = 1
+          cat compatibility-api-usage.txt
+      - name: Select an available iPhone simulator
+        run: |
+          python3 - <<'PY'
+          import json, os, subprocess
+          data = json.loads(subprocess.check_output(["xcrun", "simctl", "list", "devices", "available", "-j"]))
+          candidates = [d for runtime, devices in data["devices"].items() if "iOS" in runtime for d in devices if d.get("isAvailable") and d["name"].startswith("iPhone")]
+          if not candidates:
+              raise SystemExit("No available iPhone simulator")
+          with open(os.environ["GITHUB_ENV"], "a") as f:
+              f.write("TRIO_DESTINATION=platform=iOS Simulator,id=" + candidates[0]["udid"] + "\n")
+          PY
+      - name: Build Trio and its existing tests
+        id: build
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          xcodebuild build-for-testing -workspace Trio.xcworkspace -scheme 'Trio Tests' \
+            -destination "$TRIO_DESTINATION" -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackagePluginValidation -skipMacroValidation -quiet \
+            COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee trio-build.log
+      - name: Run relevant existing Trio tests
+        if: steps.build.outcome == 'success'
+        run: |
+          set -o pipefail
+          xcodebuild test-without-building -workspace Trio.xcworkspace -scheme 'Trio Tests' \
+            -destination "$TRIO_DESTINATION" -parallel-testing-enabled NO \
+            -only-testing:TrioTests/DanaKitAlertEmissionTests \
+            -only-testing:TrioTests/DeviceCatalogTests \
+            -only-testing:TrioTests/BasalRoundingDriverParityTests \
+            -resultBundlePath TrioCompatibility.xcresult \
+            2>&1 | tee trio-tests.log
+      - name: Compare the unmodified DanaKit baseline if the build fails
+        if: always() && steps.build.outcome == 'failure'
+        env:
+          BASELINE: ${{ matrix.baseline }}
+        run: |
+          set -o pipefail
+          git -C DanaKit checkout --detach "$BASELINE"
+          xcodebuild build-for-testing -workspace Trio.xcworkspace -scheme 'Trio Tests' \
+            -destination "$TRIO_DESTINATION" -onlyUsePackageVersionsFromResolvedFile \
+            -skipPackagePluginValidation -skipMacroValidation -quiet \
+            COMPILER_INDEX_STORE_ENABLE=NO CODE_SIGN_IDENTITY="-" CODE_SIGN_STYLE=Manual \
+            DEVELOPMENT_TEAM="" PROVISIONING_PROFILE_SPECIFIER="" \
+            2>&1 | tee trio-baseline-build.log
+      - name: Report build errors
+        if: always()
+        run: |
+          for log in trio-build.log trio-baseline-build.log; do
+            if [ -f "$log" ]; then
+              echo "::group::$log errors"
+              grep -nE 'error:|Undefined symbol|BUILD FAILED|TEST.*FAILED' "$log" | tail -n 60 || true
+              echo "::endgroup::"
+            fi
+          done
+      - name: Upload compatibility diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trio-${{ matrix.trio }}-${{ matrix.fix }}
+          path: |
+            Trio/source-revisions.txt
+            Trio/compatibility-api-usage.txt
+            Trio/trio-build.log
+            Trio/trio-tests.log
+            Trio/trio-baseline-build.log
+            Trio/TrioCompatibility.xcresult
+      - name: Require the corrected build to succeed
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+        run: test "$BUILD_OUTCOME" = success
