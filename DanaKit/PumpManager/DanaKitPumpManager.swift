@@ -331,8 +331,9 @@ extension DanaKitPumpManager: PumpManager {
         syncPump(completion)
     }
 
-    public func createBolusProgressReporter(reportingOn _: DispatchQueue) -> DoseProgressReporter? {
-        doseReporter
+    public func createBolusProgressReporter(reportingOn queue: DispatchQueue) -> DoseProgressReporter? {
+        doseReporter?.reportingQueue = queue
+        return doseReporter
     }
 
     public func estimatedDuration(toBolus units: Double) -> TimeInterval {
