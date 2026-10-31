@@ -1,0 +1,78 @@
+name: Validate bolus progress reporting queue
+on:
+  push:
+    branches: ["validation/bolus-progress-independent-reporters"]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 3
+      - uses: actions/checkout@v4
+        with:
+          repository: LoopKit/LoopKit
+          ref: d9f1437353482690426bd981536f58c1e95ff535
+          path: LoopKit
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_26.3.app/Contents/Developer
+      - name: Prepare focused tests with production sources
+        run: |
+          mkdir -p /tmp/DanaProgressTests/Sources/{LoopKit,DanaProgress} /tmp/DanaProgressTests/Tests/DanaProgressTests
+          cp LoopKit/LoopKit/{WeakSet,WeakSynchronizedSet,Locked,UnfairLock}.swift LoopKit/LoopKit/DeviceManager/DoseProgressReporter.swift /tmp/DanaProgressTests/Sources/LoopKit/
+          cp Common/Locked.swift DanaKit/PumpManager/DanaKitDoseProgressReporter.swift /tmp/DanaProgressTests/Sources/DanaProgress/
+          cp Validation/BolusProgressTests.swift /tmp/DanaProgressTests/Tests/DanaProgressTests/
+          cat > /tmp/DanaProgressTests/Package.swift <<'SWIFT'
+          // swift-tools-version: 6.0
+          import PackageDescription
+          let package = Package(
+              name: "DanaProgressTests",
+              targets: [
+                  .target(name: "LoopKit"),
+                  .target(name: "DanaProgress", dependencies: ["LoopKit"]),
+                  .testTarget(name: "DanaProgressTests", dependencies: ["DanaProgress", "LoopKit"])
+              ],
+              swiftLanguageModes: [.v5]
+          )
+          SWIFT
+      - name: Check that the original implementation fails the queue test
+        run: |
+          git show eadb9fefc0e48df6639e1a9de5147ecf6a110caf:DanaKit/PumpManager/DanaKitDoseProgressReporter.swift > /tmp/DanaProgressTests/Sources/DanaProgress/DanaKitDoseProgressReporter.swift
+          if swift test --package-path /tmp/DanaProgressTests -Xswiftc -DDANA_BASELINE > baseline.log 2>&1; then
+            cat baseline.log
+            exit 1
+          fi
+          cat baseline.log
+          grep -q 'XCTAssertTrue failed' baseline.log
+          cp DanaKit/PumpManager/DanaKitDoseProgressReporter.swift /tmp/DanaProgressTests/Sources/DanaProgress/
+      - name: Test the corrected reporter
+        run: swift test --package-path /tmp/DanaProgressTests
+      - name: Check concurrent access with Thread Sanitizer
+        run: swift test --package-path /tmp/DanaProgressTests --sanitize=thread
+      - name: Build DanaKit for the iOS Simulator
+        run: |
+          mkdir DanaKitValidation.xcworkspace
+          cat > DanaKitValidation.xcworkspace/contents.xcworkspacedata <<'XML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <Workspace version="1.0">
+            <FileRef location="group:DanaKit.xcodeproj"/>
+            <FileRef location="group:LoopKit/LoopKit.xcodeproj"/>
+          </Workspace>
+          XML
+          set -o pipefail
+          xcodebuild build -workspace DanaKitValidation.xcworkspace -scheme DanaKit \
+            -destination 'generic/platform=iOS Simulator' CODE_SIGNING_ALLOWED=NO \
+            -resultBundlePath DanaKitBuild.xcresult | tee xcodebuild.log
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bolus-progress-validation
+          path: |
+            baseline.log
+            xcodebuild.log
+            DanaKitBuild.xcresult
